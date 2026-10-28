@@ -108,33 +108,68 @@ async def test_hourly_runs_do_not_add_the_same_hour_again(clock) -> None:
         assert row["sum"] == pytest.approx(102.5), f"after the run at {hour}:06"
 
 
-def test_base_row_before_the_day_is_used_when_present() -> None:
-    sensor = RecordingSensor.__new__(RecordingSensor)
-    sensor._short_id = "x"
-    rows = [
-        {"start": dt_util.as_timestamp(HISTORY), "state": 1.0, "sum": 10.0},
-        {"start": dt_util.as_timestamp(CONSUMPTION_HOUR), "state": 4.2, "sum": 14.2},
-    ]
-    base = sensor.get_last_stats_before_date({sensor.statistic_id: rows}, TODAY)
-    assert base["sum"] == pytest.approx(10.0)
+async def test_a_day_stored_with_a_wrong_sum_is_repaired(clock) -> None:
+    """A day inflated by the former fallback is rewritten from the real base."""
+    recorder = FakeRecorder("recording:actualdhwpowerexternal")
+    recorder.add(
+        [
+            {"start": HISTORY, "state": 98.3, "sum": 98.3},
+            {"start": CONSUMPTION_HOUR, "state": 4.2, "sum": 106.7},
+        ]
+    )
+    sensor = _sensor(recorder)
+
+    clock(TODAY.replace(hour=15, minute=6))
+    await sensor._insert_statistics()
+
+    row = recorder.rows[dt_util.as_timestamp(CONSUMPTION_HOUR)]
+    assert row["sum"] == pytest.approx(102.5)
 
 
-def test_base_without_row_before_the_day_excludes_the_day() -> None:
-    """The base is the sum before the earliest row of the day, not the latest row."""
-    sensor = RecordingSensor.__new__(RecordingSensor)
-    sensor._short_id = "x"
+def _rows_today() -> dict[str, list[dict[str, float]]]:
     start = dt_util.as_timestamp(CONSUMPTION_HOUR)
-    rows = [
-        {"start": start, "state": 4.2, "sum": 102.5},
-        {"start": start + 3600, "state": 1.0, "sum": 103.5},
-    ]
-    base = sensor.get_last_stats_before_date({sensor.statistic_id: rows}, TODAY)
-    assert base["sum"] == pytest.approx(98.3)
-    assert base["start"] == pytest.approx(start - 3600)
+    return {
+        "recording:xexternal": [
+            {"start": start, "state": 4.2, "sum": 102.5},
+            {"start": start + 3600, "state": 1.0, "sum": 103.5},
+        ]
+    }
 
 
-def test_base_without_rows_is_zero() -> None:
+def _helper_sensor(recorder: FakeRecorder) -> RecordingSensor:
     sensor = RecordingSensor.__new__(RecordingSensor)
     sensor._short_id = "x"
-    base = sensor.get_last_stats_before_date({}, TODAY)
+    sensor.get_stats_from_ha_db = recorder.period
+    return sensor
+
+
+def test_no_row_before_the_day_in_the_window_is_none() -> None:
+    """The newest row of the window is no base: it belongs to the day."""
+    sensor = _helper_sensor(FakeRecorder("recording:xexternal"))
+    assert sensor.get_last_stats_before_date(_rows_today(), TODAY) is None
+
+
+async def test_base_row_in_the_window_is_used_without_a_query() -> None:
+    recorder = FakeRecorder("recording:xexternal")
+    recorder.period = AsyncMock(side_effect=AssertionError("no query expected"))
+    sensor = _helper_sensor(recorder)
+    rows = _rows_today()
+    rows["recording:xexternal"].insert(
+        0, {"start": dt_util.as_timestamp(HISTORY), "state": 1.0, "sum": 98.3}
+    )
+    base = await sensor.async_get_last_stats_before_date(rows, TODAY)
+    assert base["sum"] == pytest.approx(98.3)
+
+
+async def test_base_row_outside_the_window_is_found_further_back() -> None:
+    recorder = FakeRecorder("recording:xexternal")
+    recorder.add([{"start": HISTORY, "state": 1.0, "sum": 98.3}])
+    sensor = _helper_sensor(recorder)
+    base = await sensor.async_get_last_stats_before_date(_rows_today(), TODAY)
+    assert base["sum"] == pytest.approx(98.3)
+
+
+async def test_base_without_any_row_before_the_day_is_zero() -> None:
+    sensor = _helper_sensor(FakeRecorder("recording:xexternal"))
+    base = await sensor.async_get_last_stats_before_date(_rows_today(), TODAY)
     assert base["sum"] == 0.0
