@@ -171,21 +171,41 @@ class StatisticHelper(BoschBaseSensor):
     def get_last_stats_before_date(
         self, last_stats: dict[str, list[StatisticsRow]], day: datetime
     ) -> StatisticsRow:
-        """Find the last statistic row before a given date."""
+        """Find the last statistic row before a given date.
+
+        Hours without consumption are not stored, so the rows read from the
+        database may all lie at or after `day`. The base sum is then the sum
+        before the earliest of them (its sum minus its state), not the latest
+        row: that one already contains the day's values, and adding the day
+        again on every run made the sum grow (#599).
+        """
         day_stamp = datetime_to_timestamp_or_none(day)
         closest_stat: StatisticsRow | None = None
+        earliest_after: StatisticsRow | None = None
         for stat in last_stats.get(self.statistic_id, []):
             tstmp = stat.get("start")
-            if tstmp is not None and day_stamp is not None and tstmp < day_stamp:
+            if tstmp is None or day_stamp is None:
+                continue
+            if tstmp < day_stamp:
                 if closest_stat is None or tstmp > cast(float, closest_stat.get("start")):
                     closest_stat = stat
-        if not closest_stat and last_stats.get(self.statistic_id):
-            closest_stat = last_stats[self.statistic_id][-1]
-            _LOGGER.debug("Closest stat not found, using last available row.")
-        
-        if not closest_stat:
-            return StatisticsRow(start=0.0, state=0.0, sum=0.0)
-        return closest_stat
+            elif earliest_after is None or tstmp < cast(float, earliest_after.get("start")):
+                earliest_after = stat
+        if closest_stat:
+            return closest_stat
+        if earliest_after:
+            _LOGGER.debug(
+                "No row of %s before %s, using the sum before the earliest row.",
+                self.statistic_id,
+                day,
+            )
+            return StatisticsRow(
+                start=cast(float, earliest_after["start"]) - 3600,
+                state=0.0,
+                sum=(earliest_after.get("sum") or 0.0)
+                - (earliest_after.get("state") or 0.0),
+            )
+        return StatisticsRow(start=0.0, state=0.0, sum=0.0)
 
     async def insert_statistics_range(self, start_time: datetime) -> None:
         """Attempt to put past data into database for a 24-hour range."""
